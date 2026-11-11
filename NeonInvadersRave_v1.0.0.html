@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Neon Invaders Rave v1.0.0</title>
+<meta name="description" content="Neon Invaders Rave: a Space Invaders remix where the soundtrack is the difficulty curve. Vector glow, procedural rave techno, one HTML file.">
+<meta property="og:title" content="Neon Invaders Rave">
+<meta property="og:description" content="Shoot on the beat. Kills unlock the music. A Space Invaders and Galaga remix with a live-synthesized rave soundtrack.">
+<meta property="og:image" content="https://kumodot.github.io/NeonInvadersRave/screenshots/neon_invaders_banner.png">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; overflow: hidden; font-family: "Courier New", Courier, monospace; color: #37ffd6; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #000; touch-action: none; }
+  #crt { position: fixed; inset: 0; pointer-events: none;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.18) 2px 3px),
+      radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,.75) 100%);
+    mix-blend-mode: multiply; }
+  #ver { position: fixed; top: 8px; left: 10px; font-size: 11px; letter-spacing: .1em; padding: 2px 8px; border: 1px solid rgba(55,255,214,.45); color: #37ffd6; opacity: .7; pointer-events: none; text-shadow: 0 0 6px #37ffd6; }
+  #hint { position: fixed; left: 0; right: 0; bottom: 3px; text-align: center; font-size: 10px; opacity: .4; letter-spacing: .08em; pointer-events: none; }
+  @media (prefers-reduced-motion: reduce) { #crt { background: none; } }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="crt"></div>
+<div id="ver">v1.0.0</div>
+<div id="hint">F fullscreen · M mute · H about · keyboard, gamepad or touch</div>
+
+<script>
+// =====================================================================
+//  NEON INVADERS RAVE  v1.0.0
+//  CHANGELOG
+//  1.0.0  First public release. Heat-driven music layers, beat-quantized
+//         shots with PERFECT/GROOVE, break and drop, Galaga fighters,
+//         rhythm bomb, parallax starfield, gamepad (Steam Deck) support.
+//  Space Invaders remix where the soundtrack is the difficulty curve.
+//  - Kills build HEAT. Heat unlocks music layers (kick -> hats -> clap
+//    -> bass -> acid -> lead -> stabs -> TRIP). More layers = faster
+//    BPM, more enemy fire, wilder visuals.
+//  - Shots are quantized to the beat grid. Tap on the beat for PERFECT
+//    shots and a GROOVE multiplier. Every shot sound lands on the grid.
+//  - Every 8 bars at high heat: BREAK (invaders freeze, riser) then
+//    DROP (screen clears, 1 bar of piercing BEAM shots).
+//  Everything is procedural Web Audio. No samples, no files.
+//  Marcelo Souza / Kumodot.art - 2026 // @Msouza3d
+// =====================================================================
+
+const APP_VERSION = '1.0.0';
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+canvas.width = W; canvas.height = H;
+function fitCanvas() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = (W * s) + 'px'; canvas.style.height = (H * s) + 'px';
+}
+addEventListener('resize', fitCanvas); fitCanvas();
+
+// ---------------------------------------------------------------------
+//  MUSIC LAYERS
+// ---------------------------------------------------------------------
+const LAYERS = [
+  { name: 'KICK',    heat: 0  },
+  { name: '+HATS',   heat: 3  },
+  { name: '+CLAP',   heat: 7  },
+  { name: '+BASS',   heat: 12 },
+  { name: '+ACID',   heat: 18 },
+  { name: '+LEAD',   heat: 26 },
+  { name: '+STABS',  heat: 36 },
+  { name: 'TRIP',    heat: 48 },
+];
+const MAX_LAYER = LAYERS.length - 1;
+
+// ---------------------------------------------------------------------
+//  AUDIO ENGINE
+// ---------------------------------------------------------------------
+const Audio = {
+  ctx: null, master: null, pump: null, comp: null, delay: null, delayFb: null, muted: false,
+  baseBpm: 140, bpm: 140, step: 0, nextTime: 0, lookahead: 0.12, tickMs: 25, timer: null,
+  lastStep: 0, lastStepTime: 0, bar: 0, running: false,
+  layer: 0, dropCycle: 8, onBeat: null, onBar: null,
+
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    const c = this.ctx;
+    this.comp = c.createDynamicsCompressor();
+    this.comp.threshold.value = -12; this.comp.ratio.value = 6; this.comp.attack.value = .003; this.comp.release.value = .12;
+    this.pump = c.createGain();
+    this.master = c.createGain(); this.master.gain.value = 0.55;
+    this.pump.connect(this.comp); this.comp.connect(this.master); this.master.connect(c.destination);
+    // dotted-8th feedback delay bus, fed by lead/stabs at high layers
+    this.delay = c.createDelay(1.0); this.delayFb = c.createGain(); this.delayFb.gain.value = 0;
+    const dFilt = c.createBiquadFilter(); dFilt.type = 'lowpass'; dFilt.frequency.value = 2500;
+    this.delay.connect(dFilt); dFilt.connect(this.delayFb); this.delayFb.connect(this.delay); this.delayFb.connect(this.pump);
+    const len = c.sampleRate * 2;
+    this.noise = c.createBuffer(1, len, c.sampleRate);
+    const d = this.noise.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  },
+  start() {
+    this.init();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    if (this.running) return;
+    this.running = true; this.step = 0; this.bar = 0; this.layer = 0; this.bpm = this.baseBpm;
+    this.nextTime = this.ctx.currentTime + 0.05;
+    this.lastStep = 0; this.lastStepTime = this.nextTime;
+    this.timer = setInterval(() => this.schedule(), this.tickMs);
+  },
+  stop() { this.running = false; clearInterval(this.timer); },
+  toggleMute() { this.muted = !this.muted; if (this.master) this.master.gain.value = this.muted ? 0 : 0.55; },
+  now() { return this.ctx ? this.ctx.currentTime : 0; },
+  stepDur() { return 60 / this.bpm / 4; },
+
+  setLayer(l) {
+    this.layer = l;
+    if (this.delayFb) this.delayFb.gain.setTargetAtTime(l >= 6 ? (l >= 7 ? .55 : .35) : 0, this.now(), .1);
+  },
+
+  // Is this bar a break (last bar of the drop cycle) or a drop (first bar)?
+  phase(bar) {
+    if (this.layer < 4) return 'normal';
+    const p = bar % this.dropCycle;
+    return p === this.dropCycle - 1 ? 'break' : p === 0 ? 'drop' : 'normal';
+  },
+
+  schedule() {
+    while (this.nextTime < this.ctx.currentTime + this.lookahead) {
+      if (this.step === 0) {
+        // tempo follows the layer, applied only on bar boundaries
+        this.bpm = this.baseBpm + this.layer * 2;
+        if (this.onBar) { const b = this.bar, t = this.nextTime; setTimeout(() => this.onBar(b, this.phase(b)), Math.max(0, (t - this.ctx.currentTime) * 1000)); }
+      }
+      const d = this.stepDur();
+      this.playStep(this.step, this.nextTime, d, this.phase(this.bar));
+      if (this.step % 4 === 0 && this.onBeat) {
+        const beat = this.step / 4, t = this.nextTime, ph = this.phase(this.bar), bar = this.bar;
+        setTimeout(() => this.onBeat(beat, bar, ph), Math.max(0, (t - this.ctx.currentTime) * 1000));
+      }
+      this.lastStep = this.step; this.lastStepTime = this.nextTime;
+      this.nextTime += d;
+      this.step = (this.step + 1) % 16;
+      if (this.step === 0) this.bar++;
+    }
+  },
+
+  // Next grid time for a division in 16ths (2 = 8th notes, 4 = quarters, 1 = 16ths).
+  // Returns { t, dist } where dist is the signed distance from the *nearest* grid point.
+  grid(div, from) {
+    const d = this.stepDur(), now = from ?? this.now();
+    let next = null, prev = null;
+    for (let k = -20; k < 40; k++) {
+      const s = ((this.lastStep + k) % 16 + 16) % 16;
+      if (s % div !== 0) continue;
+      const t = this.lastStepTime + k * d;
+      if (t <= now) prev = t; else if (next === null) next = t;
+    }
+    const dNext = next - now, dPrev = prev === null ? 99 : now - prev;
+    return { next, prev, nearestDist: Math.min(dNext, dPrev), nearest: dNext < dPrev ? next : prev };
+  },
+
+  // --- instruments -----------------------------------------------------
+  kick(t, hard) {
+    const c = this.ctx, o = c.createOscillator(), g = c.createGain();
+    o.frequency.setValueAtTime(hard ? 220 : 160, t); o.frequency.exponentialRampToValueAtTime(40, t + .1);
+    g.gain.setValueAtTime(hard ? 1.4 : 1.1, t); g.gain.exponentialRampToValueAtTime(.001, t + (hard ? .5 : .28));
+    o.connect(g); g.connect(this.comp); o.start(t); o.stop(t + .5);
+    const n = c.createBufferSource(); n.buffer = this.noise;
+    const ng = c.createGain(); ng.gain.setValueAtTime(.35, t); ng.gain.exponentialRampToValueAtTime(.001, t + .02);
+    n.connect(ng); ng.connect(this.comp); n.start(t); n.stop(t + .03);
+    this.pump.gain.cancelScheduledValues(t);
+    this.pump.gain.setValueAtTime(.12, t);
+    this.pump.gain.linearRampToValueAtTime(1.0, t + .22);
+  },
+  hat(t, open, reverse) {
+    const c = this.ctx, n = c.createBufferSource(); n.buffer = this.noise;
+    const f = c.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 8000;
+    const g = c.createGain(); const d = open ? .18 : .05;
+    if (reverse) { g.gain.setValueAtTime(.001, t); g.gain.exponentialRampToValueAtTime(.3, t + d); g.gain.setValueAtTime(.001, t + d + .005); }
+    else { g.gain.setValueAtTime(open ? .28 : .2, t); g.gain.exponentialRampToValueAtTime(.001, t + d); }
+    n.connect(f); f.connect(g); g.connect(this.pump); n.start(t); n.stop(t + d + .02);
+  },
+  clap(t) {
+    const c = this.ctx;
+    for (let i = 0; i < 3; i++) {
+      const n = c.createBufferSource(); n.buffer = this.noise;
+      const f = c.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1500; f.Q.value = .8;
+      const g = c.createGain(); const tt = t + i * .012;
+      g.gain.setValueAtTime(.4, tt); g.gain.exponentialRampToValueAtTime(.001, tt + (i === 2 ? .18 : .03));
+      n.connect(f); f.connect(g); g.connect(this.pump); n.start(tt); n.stop(tt + .2);
+    }
+  },
+  bass(t, freq, dur) {
+    const c = this.ctx, o = c.createOscillator(), o2 = c.createOscillator();
+    o.type = 'sawtooth'; o2.type = 'square'; o.frequency.value = freq; o2.frequency.value = freq / 2;
+    const f = c.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 8;
+    f.frequency.setValueAtTime(1800, t); f.frequency.exponentialRampToValueAtTime(220, t + dur);
+    const g = c.createGain(); g.gain.setValueAtTime(.55, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+    o.connect(f); o2.connect(f); f.connect(g); g.connect(this.pump);
+    o.start(t); o2.start(t); o.stop(t + dur); o2.stop(t + dur);
+  },
+  acid(t, freq, dur, accent) {
+    // 303-ish: single saw, screaming resonant lowpass, accent opens it more
+    const c = this.ctx, o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = freq;
+    const f = c.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 14;
+    const top = (accent ? 3200 : 1400) * (0.6 + 0.6 * this.layer / MAX_LAYER);
+    f.frequency.setValueAtTime(top, t); f.frequency.exponentialRampToValueAtTime(180, t + dur);
+    const g = c.createGain(); g.gain.setValueAtTime(accent ? .5 : .32, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+    o.connect(f); f.connect(g); g.connect(this.pump); o.start(t); o.stop(t + dur);
+  },
+  lead(t, freq, dur, vol, lfo) {
+    const c = this.ctx, g = c.createGain(), f = c.createBiquadFilter();
+    f.type = 'lowpass'; f.Q.value = 3;
+    f.frequency.setValueAtTime(800 + 3800 * (this.layer / MAX_LAYER) * (lfo ?? 1), t);
+    f.frequency.exponentialRampToValueAtTime(300, t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+    [-12, -5, 0, 5, 12].forEach(cents => {
+      const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = freq; o.detune.value = cents;
+      o.connect(f); o.start(t); o.stop(t + dur);
+    });
+    f.connect(g); g.connect(this.pump); g.connect(this.delay);
+  },
+  stab(t, root) {
+    const c = this.ctx, g = c.createGain(), f = c.createBiquadFilter();
+    f.type = 'bandpass'; f.frequency.setValueAtTime(3000, t); f.frequency.exponentialRampToValueAtTime(500, t + .35); f.Q.value = 1.5;
+    g.gain.setValueAtTime(.5, t); g.gain.exponentialRampToValueAtTime(.001, t + .4);
+    [1, 1.189, 1.498, 2].forEach(r => {
+      const o = c.createOscillator(); o.type = 'sawtooth';
+      o.frequency.setValueAtTime(root * r * 1.06, t); o.frequency.exponentialRampToValueAtTime(root * r, t + .12);
+      o.connect(f); o.start(t); o.stop(t + .4);
+    });
+    f.connect(g); g.connect(this.pump); g.connect(this.delay);
+  },
+  pad(t, root, dur) {
+    // slow detuned minor chord under the trip
+    const c = this.ctx, g = c.createGain(), f = c.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.setValueAtTime(400, t); f.frequency.linearRampToValueAtTime(2200, t + dur * .5); f.frequency.linearRampToValueAtTime(400, t + dur);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.14, t + .3); g.gain.linearRampToValueAtTime(0, t + dur);
+    [1, 1.189, 1.498, 2, 2.378].forEach((r, i) => {
+      const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = root * r; o.detune.value = (i % 2 ? 7 : -7);
+      o.connect(f); o.start(t); o.stop(t + dur);
+    });
+    f.connect(g); g.connect(this.pump);
+  },
+  riser(t, dur) {
+    // noise + pitch sweeping up for the break bar
+    const c = this.ctx, n = c.createBufferSource(); n.buffer = this.noise; n.loop = true;
+    const f = c.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 2;
+    f.frequency.setValueAtTime(300, t); f.frequency.exponentialRampToValueAtTime(8000, t + dur);
+    const g = c.createGain(); g.gain.setValueAtTime(.05, t); g.gain.linearRampToValueAtTime(.5, t + dur); g.gain.setValueAtTime(0, t + dur + .01);
+    n.connect(f); f.connect(g); g.connect(this.master); n.start(t); n.stop(t + dur + .05);
+    const o = c.createOscillator(); o.type = 'sawtooth';
+    o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(880, t + dur);
+    const og = c.createGain(); og.gain.setValueAtTime(.001, t); og.gain.exponentialRampToValueAtTime(.25, t + dur); og.gain.setValueAtTime(0, t + dur + .01);
+    o.connect(og); og.connect(this.master); o.start(t); o.stop(t + dur + .05);
+  },
+
+  // --- sequencer ----------------------------------------------------------
+  bassRoots: [55.0, 55.0, 65.41, 73.42],       // A1 A1 C2 D2
+  arp:  [220, 261.6, 329.6, 440, 329.6, 261.6, 220, 329.6, 440, 523.3, 440, 329.6, 261.6, 329.6, 220, 261.6],
+  arp2: [440, 440, 523.3, 659.3, 440, 587.3, 523.3, 440, 659.3, 659.3, 783.9, 880, 659.3, 587.3, 523.3, 440],
+  acidLine: [0, 0, 12, 0, 7, 0, 0, 12, 0, 3, 0, 12, 0, 7, 10, 12],   // semitones over root
+  acidAcc:  [1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1],
+
+};
+// One 16-step bar. Each layer gates a new voice.
+Audio.playStep = function (s, t, d, ph) {
+  const L = this.layer, bar = this.bar, root = this.bassRoots[bar % 4];
+  if (ph === 'break') {
+    if (s === 0) this.riser(t, d * 16);
+    if (s % 2 === 0) this.hat(t, false, true);
+    if (s >= 12 && s % 2 === 0) this.clap(t);
+    if (s === 14 || s === 15) this.kick(t, true);           // two hard kicks leading into the drop
+    return;
+  }
+  const drop = ph === 'drop';
+  if (s % 4 === 0) this.kick(t, drop && s === 0);
+  if (L >= 1) this.hat(t, s % 4 === 2, L >= 7 && s % 8 === 6);
+  if (L >= 2) { if (s === 4 || s === 12) this.clap(t); if (s % 4 === 2) this.bass(t, root, d * 1.8); }
+  if (L >= 3 && s % 2 === 1) this.bass(t, root * 2, d * .8);
+  if (L >= 4) { const semi = this.acidLine[s]; if (semi > 0 || this.acidAcc[s]) this.acid(t, root * 2 * Math.pow(2, semi / 12), d * 1.3, this.acidAcc[s]); }
+  if (L >= 5) {
+    const oct = (L >= 6 && bar % 4 >= 2) ? 2 : 1;
+    const lfo = L >= 7 ? 0.5 + 0.5 * Math.sin(bar * 1.3 + s * .4) : 1;
+    this.lead(t, this.arp[s] * oct, d * 1.6, .16, lfo);
+  }
+  if (L >= 6 && bar % 2 === 1 && (s === 0 || s === 6 || s === 10)) this.stab(t, root * 4);
+  if (L >= 7) {
+    if (s % 2 === 0) this.lead(t, this.arp2[s] * (bar % 2 ? 1 : .5), d * 2.2, .08, 1);
+    if (s === 0) this.pad(t, root * 4, d * 16);
+  }
+  if (drop && s === 0) this.stab(t, root * 4);
+  if (this.dancers && s % 4 === 2) this.bell(t);
+  if (this.dancers && s % 8 === 7) this.bell(t);
+  if (L >= 2 && bar % 8 === 6 && s >= 12) this.clap(t + d * .5);   // pre-break fill
+};
+
+// --- SFX ------------------------------------------------------------------
+Audio.sfxShoot = function (t, perfect) {
+  if (!this.ctx) return; const c = this.ctx; t = t ?? c.currentTime;
+  const o = c.createOscillator(), g = c.createGain(); o.type = 'square';
+  // pitched to the current bass root so shots are always in key
+  const base = this.bassRoots[this.bar % 4] * (perfect ? 32 : 16);
+  o.frequency.setValueAtTime(base * 2, t); o.frequency.exponentialRampToValueAtTime(base * .5, t + .1);
+  g.gain.setValueAtTime(perfect ? .24 : .16, t); g.gain.exponentialRampToValueAtTime(.001, t + .12);
+  o.connect(g); g.connect(this.master); if (perfect) g.connect(this.delay); o.start(t); o.stop(t + .13);
+};
+Audio.sfxBoom = function (big) {
+  if (!this.ctx) return; const c = this.ctx, t = c.currentTime;
+  const n = c.createBufferSource(); n.buffer = this.noise;
+  const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.setValueAtTime(big ? 3000 : 1800, t); f.frequency.exponentialRampToValueAtTime(100, t + (big ? .6 : .25));
+  const g = c.createGain(); g.gain.setValueAtTime(big ? .9 : .35, t); g.gain.exponentialRampToValueAtTime(.001, t + (big ? .7 : .3));
+  n.connect(f); f.connect(g); g.connect(this.master); n.start(t); n.stop(t + .8);
+};
+Audio.sfxHit = function () {
+  // kill sound quantized to next 16th so explosions sit in the groove
+  if (!this.ctx) return; const c = this.ctx; const g16 = this.grid(1); const t = g16.next ?? c.currentTime;
+  const o = c.createOscillator(), g = c.createGain(); o.type = 'triangle';
+  o.frequency.setValueAtTime(this.bassRoots[this.bar % 4] * 8, t); o.frequency.exponentialRampToValueAtTime(this.bassRoots[this.bar % 4] * 2, t + .15);
+  g.gain.setValueAtTime(.3, t); g.gain.exponentialRampToValueAtTime(.001, t + .18);
+  o.connect(g); g.connect(this.master); o.start(t); o.stop(t + .2);
+};
+Audio.sfxBombLaunch = function (t) {
+  // rising whistle, quantized to the beat it launches on
+  if (!this.ctx) return; const c = this.ctx;
+  const o = c.createOscillator(), g = c.createGain(); o.type = 'sine';
+  o.frequency.setValueAtTime(300, t); o.frequency.exponentialRampToValueAtTime(2400, t + .9);
+  g.gain.setValueAtTime(.001, t); g.gain.exponentialRampToValueAtTime(.3, t + .1); g.gain.exponentialRampToValueAtTime(.001, t + .95);
+  o.connect(g); g.connect(this.master); g.connect(this.delay); o.start(t); o.stop(t + 1);
+};
+Audio.sfxBombBlast = function () {
+  if (!this.ctx) return; const c = this.ctx, t = c.currentTime;
+  this.sfxBoom(true);
+  // big detuned chord bloom, in key
+  const root = this.bassRoots[this.bar % 4] * 4;
+  [1, 1.189, 1.498, 2, 2.378, 2.997].forEach((r, i) => {
+    const o = c.createOscillator(), g = c.createGain(); o.type = 'sawtooth'; o.frequency.value = root * r; o.detune.value = (i % 2 ? 9 : -9);
+    g.gain.setValueAtTime(0, t + i * .03); g.gain.linearRampToValueAtTime(.12, t + i * .03 + .05); g.gain.exponentialRampToValueAtTime(.001, t + 1.4);
+    o.connect(g); g.connect(this.master); g.connect(this.delay); o.start(t + i * .03); o.stop(t + 1.5);
+  });
+};
+Audio.bell = function (t) {
+  // disco cowbell/ride ping for the dance floor
+  const c = this.ctx, o = c.createOscillator(), o2 = c.createOscillator(), g = c.createGain();
+  o.type = 'square'; o2.type = 'square'; o.frequency.value = 800; o2.frequency.value = 540;
+  const f = c.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1800; f.Q.value = 4;
+  g.gain.setValueAtTime(.25, t); g.gain.exponentialRampToValueAtTime(.001, t + .12);
+  o.connect(f); o2.connect(f); f.connect(g); g.connect(this.pump); o.start(t); o2.start(t); o.stop(t + .13); o2.stop(t + .13);
+};
+Audio.sfxUnlock = function () {
+  if (!this.ctx) return; const c = this.ctx, t = c.currentTime;
+  [440, 660, 880, 1320, 1760].forEach((f, i) => {
+    const o = c.createOscillator(), g = c.createGain(); o.type = 'triangle'; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t + i * .05); g.gain.linearRampToValueAtTime(.25, t + i * .05 + .01); g.gain.exponentialRampToValueAtTime(.001, t + i * .05 + .2);
+    o.connect(g); g.connect(this.master); g.connect(this.delay); o.start(t + i * .05); o.stop(t + i * .05 + .25);
+  });
+};
+
+// ---------------------------------------------------------------------
+//  VECTOR DRAWING
+// ---------------------------------------------------------------------
+const C = { phos: '#37ffd6', hot: '#ff2bd6', amber: '#ffb133', white: '#e8fffb', purple: '#c84bff' };
+function strokePoly(pts, color, x = 0, y = 0, s = 1, rot = 0, width = 2, close = true) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+  ctx.strokeStyle = color; ctx.lineWidth = width / s; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.shadowColor = color; ctx.shadowBlur = 14;
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  if (close) ctx.closePath(); ctx.stroke(); ctx.restore();
+}
+function line(x1, y1, x2, y2, color, width = 2) { strokePoly([[x1, y1], [x2, y2]], color, 0, 0, 1, 0, width, false); }
+
+const FONT = {
+  'A': [[[0,6],[0,1],[2,0],[4,1],[4,6]],[[0,3],[4,3]]], 'B': [[[0,6],[0,0],[3,0],[4,1],[3,3],[0,3]],[[3,3],[4,4],[3,6],[0,6]]],
+  'C': [[[4,1],[3,0],[1,0],[0,1],[0,5],[1,6],[3,6],[4,5]]], 'D': [[[0,6],[0,0],[3,0],[4,1],[4,5],[3,6],[0,6]]],
+  'E': [[[4,0],[0,0],[0,6],[4,6]],[[0,3],[3,3]]], 'F': [[[4,0],[0,0],[0,6]],[[0,3],[3,3]]], 'G': [[[4,1],[3,0],[1,0],[0,1],[0,5],[1,6],[3,6],[4,5],[4,3],[2,3]]],
+  'H': [[[0,0],[0,6]],[[4,0],[4,6]],[[0,3],[4,3]]], 'I': [[[1,0],[3,0]],[[2,0],[2,6]],[[1,6],[3,6]]], 'J': [[[4,0],[4,5],[3,6],[1,6],[0,5]]],
+  'K': [[[0,0],[0,6]],[[4,0],[0,3],[4,6]]], 'L': [[[0,0],[0,6],[4,6]]], 'M': [[[0,6],[0,0],[2,3],[4,0],[4,6]]], 'N': [[[0,6],[0,0],[4,6],[4,0]]],
+  'O': [[[1,0],[3,0],[4,1],[4,5],[3,6],[1,6],[0,5],[0,1],[1,0]]], 'P': [[[0,6],[0,0],[3,0],[4,1],[4,2],[3,3],[0,3]]], 'Q': [[[1,0],[3,0],[4,1],[4,5],[3,6],[1,6],[0,5],[0,1],[1,0]],[[2,4],[4,6]]],
+  'R': [[[0,6],[0,0],[3,0],[4,1],[4,2],[3,3],[0,3]],[[2,3],[4,6]]], 'S': [[[4,1],[3,0],[1,0],[0,1],[0,2],[1,3],[3,3],[4,4],[4,5],[3,6],[1,6],[0,5]]],
+  'T': [[[0,0],[4,0]],[[2,0],[2,6]]], 'U': [[[0,0],[0,5],[1,6],[3,6],[4,5],[4,0]]], 'V': [[[0,0],[2,6],[4,0]]], 'W': [[[0,0],[0,6],[2,3],[4,6],[4,0]]],
+  'X': [[[0,0],[4,6]],[[4,0],[0,6]]], 'Y': [[[0,0],[2,3],[4,0]],[[2,3],[2,6]]], 'Z': [[[0,0],[4,0],[0,6],[4,6]]],
+  '0': [[[1,0],[3,0],[4,1],[4,5],[3,6],[1,6],[0,5],[0,1],[1,0]],[[0,5],[4,1]]], '1': [[[1,1],[2,0],[2,6]],[[1,6],[3,6]]],
+  '2': [[[0,1],[1,0],[3,0],[4,1],[4,2],[0,6],[4,6]]], '3': [[[0,0],[4,0],[2,3],[4,4],[4,5],[3,6],[1,6],[0,5]]], '4': [[[3,6],[3,0],[0,4],[4,4]]],
+  '5': [[[4,0],[0,0],[0,3],[3,3],[4,4],[4,5],[3,6],[0,6]]], '6': [[[3,0],[1,0],[0,1],[0,5],[1,6],[3,6],[4,5],[4,4],[3,3],[0,3]]],
+  '7': [[[0,0],[4,0],[1,6]]], '8': [[[1,0],[3,0],[4,1],[4,2],[3,3],[1,3],[0,4],[0,5],[1,6],[3,6],[4,5],[4,4],[3,3],[1,3],[0,2],[0,1],[1,0]]],
+  '9': [[[1,6],[3,6],[4,5],[4,1],[3,0],[1,0],[0,1],[0,2],[1,3],[4,3]]],
+  '.': [[[2,5],[2,6]]], ':': [[[2,1],[2,2]],[[2,4],[2,5]]], '-': [[[1,3],[3,3]]], '+': [[[2,1],[2,5]],[[0,3],[4,3]]], '/': [[[0,6],[4,0]]], '@': [[[3,4],[3,2],[1,2],[1,4],[3,4],[4,3],[4,1],[3,0],[1,0],[0,1],[0,5],[1,6],[3,6]]],
+  '!': [[[2,0],[2,4]],[[2,5],[2,6]]], '?': [[[0,1],[1,0],[3,0],[4,1],[4,2],[2,3],[2,4]],[[2,5],[2,6]]], ',': [[[2,5],[1,7]]], '(': [[[3,0],[1,2],[1,4],[3,6]]], ')': [[[1,0],[3,2],[3,4],[1,6]]], ' ': []
+};
+function vtext(str, x, y, size, color, align = 'left', width = 1.6) {
+  str = str.toUpperCase();
+  const cw = size * 1.4, total = str.length * cw;
+  let ox = align === 'center' ? x - total / 2 : align === 'right' ? x - total : x;
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.shadowColor = color; ctx.shadowBlur = 10;
+  for (const ch of str) {
+    for (const stroke of (FONT[ch] || [])) {
+      ctx.beginPath();
+      stroke.forEach((p, i) => { const px = ox + p[0] * size / 4, py = y + p[1] * size / 6; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+      ctx.stroke();
+    }
+    ox += cw;
+  }
+  ctx.restore();
+}
+
+const SHIP = [[0,-14],[10,10],[4,6],[0,10],[-4,6],[-10,10]];
+const INVADERS = [
+  [[-10,-6],[-4,-10],[4,-10],[10,-6],[10,4],[6,8],[2,4],[-2,4],[-6,8],[-10,4]],
+  [[-12,0],[-6,-8],[6,-8],[12,0],[8,8],[4,2],[0,8],[-4,2],[-8,8]],
+  [[-12,-4],[-6,-10],[6,-10],[12,-4],[12,4],[6,8],[-6,8],[-12,4]],
+];
+const UFO = [[-18,0],[-10,-8],[10,-8],[18,0],[10,6],[-10,6]];
+
+// ---------------------------------------------------------------------
+//  GAME STATE
+// ---------------------------------------------------------------------
+const G = {
+  state: 'title', score: 0, hi: 0, lives: 3, wave: 1,
+  player: null, bullets: [], ebullets: [], invaders: [], particles: [], shields: [], powerups: [], ufo: null,
+  dir: 1, shake: 0, flash: 0, beatPulse: 0, bar: 0, phase: 'normal',
+  keys: {}, touchX: null, power: null, powerT: 0, t: 0,
+  heat: 0, layer: 0, maxLayer: 0, groove: 1, perfectStreak: 0, pending: [], lastTapT: -1,
+  beam: 0, toasts: [], judge: null, tunnel: 0,
+  bombs: 0, bombProj: null, blasts: [], danceBeat: 0
+};
+try { G.hi = +localStorage.getItem('nir_hi') || 0; } catch (e) {}
+
+// Parallax starfield: 3 depth planes scrolling down. Speed rises with the layer and kicks on the beat.
+const STARS = [];
+for (let d = 0; d < 3; d++) for (let i = 0; i < [60, 40, 24][d]; i++)
+  STARS.push({ x: Math.random() * W, y: Math.random() * H, d, tw: Math.random() * 6.28 });
+function updateStars() {
+  const boost = G.state === 'play' ? 1 + G.layer * .9 + G.beatPulse * 2.5 + (G.beam > 0 ? 6 : 0) : .6;
+  for (const s of STARS) {
+    s.y += [0.4, 1.1, 2.4][s.d] * boost; s.tw += .1;
+    if (s.y > H + 10) { s.y = -10; s.x = Math.random() * W; }
+  }
+}
+function drawStars() {
+  const streak = G.state === 'play' ? G.layer * .9 + G.beatPulse * 3 + (G.beam > 0 ? 8 : 0) : 0;
+  ctx.save(); ctx.lineCap = 'round';
+  for (const s of STARS) {
+    const bright = [.25, .45, .8][s.d] * (0.75 + 0.25 * Math.sin(s.tw));
+    const len = [0.4, 1.1, 2.4][s.d] * streak;          // streaks stretch as the field speeds up
+    ctx.globalAlpha = bright;
+    ctx.strokeStyle = G.layer >= 7 ? C.purple : s.d === 2 ? C.white : C.phos;
+    ctx.lineWidth = [1, 1.3, 1.8][s.d];
+    ctx.shadowColor = ctx.strokeStyle; ctx.shadowBlur = s.d === 2 ? 8 : 0;
+    ctx.beginPath(); ctx.moveTo(s.x, s.y - len); ctx.lineTo(s.x, s.y + 0.6); ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.restore();
+}
+
+// Event text. Big toasts own the centre; small ones stack above it. A new
+// toast bumps whatever is already there upward and fades it faster, and a
+// repeat of the same text just refreshes the existing one.
+function toast(text, color, big) {
+  const same = G.toasts.find(t => t.text === text);
+  if (same) { same.life = 1; same.color = color; return; }
+  for (const t of G.toasts) { t.ty -= t.big ? 44 : 26; t.life = Math.min(t.life, .55); }
+  const ty = big ? H / 2 - 60 : H / 2 - 110;
+  G.toasts.push({ text, color, life: 1, big, y: ty + 14, ty });
+}
+function newPlayer() { return { x: W / 2, y: H - 50, dead: 0 }; }
+
+function spawnWave() {
+  G.invaders = [];
+  const cols = 10, rows = Math.min(5, 3 + Math.floor(G.wave / 2));
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++)
+    G.invaders.push({ x: 110 + c * 60, y: 80 + r * 44, type: Math.min(2, Math.floor(r / 2)), hp: 1, phase: Math.random() * 6.28, dive: null, dance: 0, ox: 0, oy: 0 });
+  G.dir = 1; G.ebullets = []; G.ufo = null; G.shields = []; G.bombProj = null; G.blasts = [];
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 6; j++)
+    G.shields.push({ x: 120 + i * 170 + j * 12, y: H - 130 + (j % 2) * 10, hp: 3 });
+}
+
+// ---------------------------------------------------------------------
+//  GALAGA DIVERS
+//  An invader keeps its formation slot (x, y) as "home" and renders at
+//  home + (ox, oy). A dive is a scripted offset path: loop out of the
+//  slot, weave down to shield height, strafe, then climb back home.
+// ---------------------------------------------------------------------
+function invPos(inv) { return { x: inv.x + inv.ox, y: inv.y + inv.oy }; }
+function startDive(inv) {
+  const side = inv.x < W / 2 ? 1 : -1;
+  inv.dive = { t: 0, side, dur: 240 - G.layer * 12, targetY: (H - 165) - inv.y, shotDone: false, weave: 60 + Math.random() * 60 };
+}
+function updateDive(inv) {
+  const d = inv.dive; d.t += 1 / d.dur; const u = d.t;
+  if (u >= 1) { inv.dive = null; inv.ox = 0; inv.oy = 0; return; }
+  if (u < .2) {                                   // 1. barrel loop out of formation
+    const a = (u / .2) * Math.PI * 2;
+    inv.ox = d.side * (Math.sin(a) * 40); inv.oy = -(1 - Math.cos(a)) * 28;
+  } else if (u < .7) {                            // 2. sinuous descent to shield height
+    const v = (u - .2) / .5, e = v * v * (3 - 2 * v);
+    inv.oy = e * d.targetY;
+    inv.ox = d.side * Math.sin(v * Math.PI * 3) * d.weave;
+    if (!d.shotDone && v > .5) { d.shotDone = true; const p = invPos(inv); G.ebullets.push({ x: p.x, y: p.y + 10, vy: 5 + G.layer * .3, wob: 0 }); }
+  } else {                                        // 3. climb back home on a wide arc
+    const v = (u - .7) / .3, e = 1 - (1 - v) * (1 - v);
+    inv.oy = d.targetY * (1 - e);
+    inv.ox = d.side * Math.sin((1 - v) * Math.PI) * 120 * (1 - e * .5);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  RHYTHM BOMB (Moonwalker style)
+//  Launch with X. Rises, bursts at altitude. Every invader in the blast
+//  radius stops fighting and dances to the music for 4 bars: no fire,
+//  divers return home, double points. Rare drop.
+// ---------------------------------------------------------------------
+const BOMB_RADIUS = 150, DANCE_BARS = 4;
+function launchBomb() {
+  if (G.bombs <= 0 || G.bombProj || !G.player || G.player.dead) return;
+  const g = Audio.grid(4);                         // launches on the next quarter note
+  G.bombs--; G.bombProj = { x: G.player.x, y: G.player.y - 16, t0: g.next ?? Audio.now(), vy: 0, live: false };
+  Audio.sfxBombLaunch(G.bombProj.t0);
+}
+function updateBomb() {
+  const b = G.bombProj; if (!b) return;
+  if (!b.live) { if (Audio.now() >= b.t0) b.live = true; else { b.x = G.player.x; return; } }
+  b.vy = Math.min(7, b.vy + .35); b.y -= b.vy;
+  G.particles.push({ x: b.x + (Math.random() - .5) * 4, y: b.y + 8, vx: 0, vy: 2, life: .6, color: C.amber, len: 3 });
+  let hit = b.y < 220;
+  if (!hit) for (const inv of G.invaders) { const p = invPos(inv); if (Math.abs(p.x - b.x) < 16 && Math.abs(p.y - b.y) < 14) { hit = true; break; } }
+  if (hit) detonateBomb(b.x, b.y);
+}
+function detonateBomb(x, y) {
+  G.bombProj = null; G.blasts.push({ x, y, r: 0, life: 1 });
+  G.shake = 12; G.flash = .9; burst(x, y, C.amber, 50, 7);
+  let n = 0; const beats = DANCE_BARS * 4;
+  for (const inv of G.invaders) {
+    const p = invPos(inv);
+    if (Math.hypot(p.x - x, p.y - y) <= BOMB_RADIUS) { inv.dance = beats; inv.dive = null; inv.ox = 0; inv.oy = 0; inv.dstep = 0; n++; }
+  }
+  Audio.sfxBombBlast(); toast(n ? n + ' DANCERS' : 'MISSED', n ? C.amber : 'rgba(255,177,51,0.5)', true);
+}
+// choreography step, called on every beat for each dancing invader
+function danceStep(inv, beat) {
+  inv.dance--; inv.dstep = (inv.dstep || 0) + 1; const s = inv.dstep;
+  // lean left/right every beat, hop on 2 and 4, spin every 4 beats, moonwalk slide every 8
+  inv.dLean = (s % 2 ? 1 : -1) * .5;
+  inv.dHop = (beat % 2 === 1) ? 1 : 0;
+  inv.dSpin = (s % 4 === 0) ? 1 : 0;
+  inv.dSlide = (s % 8 === 0) ? (s % 16 === 0 ? -1 : 1) : 0;
+  if (inv.dance <= 0) { inv.dance = 0; inv.dLean = 0; inv.dHop = 0; inv.dSpin = 0; inv.dSlide = 0; }
+}
+function resetGame() {
+  G.score = 0; G.lives = 3; G.wave = 1; G.player = newPlayer();
+  G.bullets = []; G.particles = []; G.powerups = []; G.power = null; G.powerT = 0; G.pending = [];
+  G.heat = 0; G.layer = 0; G.maxLayer = 0; G.groove = 1; G.perfectStreak = 0; G.beam = 0; G.toasts = []; G.judge = null;
+  G.bombs = 1; G.bombProj = null; G.blasts = [];
+  Audio.setLayer(0);
+  spawnWave(); G.state = 'play';
+}
+function burst(x, y, color, n = 14, speed = 3) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, v = speed * (0.4 + Math.random());
+    G.particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 1, color, len: 4 + Math.random() * 8 });
+  }
+}
+
+// ---------------------------------------------------------------------
+//  HEAT -> LAYERS
+// ---------------------------------------------------------------------
+function addHeat(n) {
+  G.heat = Math.min(LAYERS[MAX_LAYER].heat + 10, G.heat + n);
+  syncLayer();
+}
+function syncLayer() {
+  let l = 0; for (let i = 0; i <= MAX_LAYER; i++) if (G.heat >= LAYERS[i].heat) l = i;
+  if (l !== G.layer) {
+    const up = l > G.layer;
+    G.layer = l; Audio.setLayer(l);
+    if (up) { toast(LAYERS[l].name, l === MAX_LAYER ? C.purple : C.amber, l === MAX_LAYER); Audio.sfxUnlock(); G.flash = .5; }
+    if (l > G.maxLayer) G.maxLayer = l;
+  }
+}
+
+// Beat callbacks: invaders step on the kick; enemy fire follows the layer
+Audio.onBeat = (beat, bar, ph) => {
+  G.beatPulse = 1; G.bar = bar; G.phase = ph; G.beatIdx = beat;
+  if (G.state !== 'play') return;
+  if (ph === 'break') return;                       // frozen during the break
+  if (ph === 'drop' && beat === 0) {
+    // THE DROP: enemy shots vanish, screen quake, one bar of BEAM
+    G.ebullets = []; G.shake = 18; G.flash = 1; G.beam = 16; toast('DROP', C.hot, true);
+    burst(W / 2, H / 2, C.hot, 60, 9);
+    for (const inv of G.invaders) inv.y += 12;
+  }
+  const alive = G.invaders.length;
+  // choreography ticks on the beat
+  let dancers = 0;
+  for (const inv of G.invaders) if (inv.dance > 0) { danceStep(inv, beat); dancers++; }
+  Audio.dancers = dancers > 0;
+  // Galaga divers: from +CLAP up, a fighter peels off. More and more often as layers stack.
+  if (G.layer >= 2 && ph !== 'drop') {
+    const diving = G.invaders.filter(i => i.dive).length;
+    const maxDivers = 1 + Math.floor(G.layer / 2);
+    const chance = .12 + G.layer * .06 + (alive < 12 ? .25 : 0);
+    if (diving < maxDivers && Math.random() < chance) {
+      const cand = G.invaders.filter(i => !i.dive && !i.dance);
+      // prefer the lowest rows (front-line fighters)
+      cand.sort((a, b) => b.y - a.y);
+      const pick = cand[Math.floor(Math.random() * Math.min(cand.length, 10))];
+      if (pick) startDive(pick);
+    }
+  }
+  const every = alive > 30 && G.layer < 5 ? 2 : 1;
+  if (beat % every === 0) {
+    let hitEdge = false; const step = 14 + G.wave * 2 + G.layer;
+    for (const inv of G.invaders) { inv.x += G.dir * step; if (inv.x < 40 || inv.x > W - 40) hitEdge = true; }
+    if (hitEdge) { G.dir *= -1; for (const inv of G.invaders) inv.y += 18; G.shake = 4; }
+  }
+  // enemy fire: on claps (beats 1,3) at low layers, every beat from +ACID up
+  const fireBeat = G.layer >= 4 || beat % 2 === 1;
+  const shooters = G.invaders.filter(i => !i.dive && !i.dance);
+  if (fireBeat && shooters.length) {
+    const shots = 1 + Math.floor(G.layer / 3) + Math.floor(G.wave / 3);
+    for (let i = 0; i < shots; i++) {
+      const src = shooters[Math.floor(Math.random() * shooters.length)];
+      if (src && Math.random() < .7) G.ebullets.push({ x: src.x, y: src.y + 10, vy: 3.2 + G.layer * .35 + G.wave * .3, wob: Math.random() * 6.28 });
+    }
+  }
+  if (!G.ufo && beat === 0 && bar % 4 === 2 && Math.random() < .5) G.ufo = { x: -30, y: 45, vx: 2.6 + G.layer * .3 };
+};
+Audio.onBar = (bar, ph) => { if (ph === 'break' && G.state === 'play') { toast('BREAK', C.phos, false); G.tunnel = 1; } };
+
+// ---------------------------------------------------------------------
+//  INPUT + QUANTIZED FIRE
+// ---------------------------------------------------------------------
+addEventListener('keydown', e => {
+  if (e.repeat) { G.keys[e.code] = true; return; }
+  G.keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  handlePress(e.code);
+});
+addEventListener('keyup', e => { G.keys[e.code] = false; });
+function handlePress(code) {
+  if (code === 'KeyM') { Audio.init(); Audio.toggleMute(); return; }
+  if (code === 'KeyF') { toggleFullscreen(); return; }
+  if (code === 'KeyH') { G.state = (G.state === 'about') ? 'title' : 'about'; return; }
+  if (G.state === 'title' || G.state === 'over') { if (code === 'Space' || code === 'Enter') { Audio.start(); resetGame(); } }
+  else if (G.state === 'about') { if (code === 'Space' || code === 'Enter' || code === 'Escape') G.state = 'title'; }
+  else if (code === 'KeyP' || code === 'Escape') { G.state = G.state === 'play' ? 'pause' : 'play'; }
+  else if (code === 'Space' && G.state === 'play') tapFire();
+  else if (code === 'KeyX' && G.state === 'play') launchBomb();
+}
+let touchStart = null;
+canvas.addEventListener('pointerdown', e => {
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
+  touchStart = { x, y, moved: false };
+  if (G.state !== 'play') { handlePress(G.state === 'about' ? 'Escape' : 'Space'); return; }
+  if (y < 70) { launchBomb(); touchStart = null; return; }
+  G.touchX = x;
+});
+canvas.addEventListener('pointermove', e => {
+  if (!touchStart || G.state !== 'play') return;
+  const r = canvas.getBoundingClientRect(); const x = (e.clientX - r.left) / r.width * W;
+  if (Math.abs(x - touchStart.x) > 6) touchStart.moved = true;
+  G.touchX = x;
+});
+addEventListener('pointerup', () => { if (touchStart && !touchStart.moved && G.state === 'play') tapFire(); touchStart = null; G.touchX = null; });
+
+const PERFECT_WINDOW = 0.07;   // seconds around a grid point that counts as on-beat
+
+// ---------------------------------------------------------------------
+//  GAMEPAD (Xbox layout, which is what Steam Deck / Steam Input reports)
+//  Left stick or D-pad: move. A: fire (press = tap, hold = auto).
+//  B or X: rhythm bomb. Y: about. Start: pause. Back: mute.
+//  Note: browsers do not count gamepad input as a "user gesture", so the
+//  very first audio unlock still needs one click or key press.
+// ---------------------------------------------------------------------
+const Pad = { prev: {}, left: false, right: false, fire: false, axis: 0 };
+function pollGamepad() {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  let gp = null; for (const g of gps) if (g && g.connected) { gp = g; break; }
+  if (!gp) { Pad.left = Pad.right = Pad.fire = false; Pad.axis = 0; return; }
+  const b = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
+  const ax = gp.axes[0] || 0;
+  Pad.axis = Math.abs(ax) > .18 ? ax : 0;
+  Pad.left = b(14) || ax < -.4; Pad.right = b(15) || ax > .4;
+  Pad.fire = b(0) || b(7);                                   // A or right trigger
+  const edges = { fire: b(0) || b(7), bomb: b(1) || b(2) || b(6), about: b(3), start: b(9), back: b(8), up: b(12) };
+  for (const k in edges) {
+    if (edges[k] && !Pad.prev[k]) {
+      if (k === 'fire') { if (G.state === 'play') tapFire(); else handlePress('Space'); }
+      else if (k === 'bomb') { if (G.state === 'play') launchBomb(); else handlePress('Space'); }
+      else if (k === 'about') handlePress('KeyH');
+      else if (k === 'start') handlePress(G.state === 'play' || G.state === 'pause' ? 'KeyP' : 'Space');
+      else if (k === 'back') handlePress('KeyM');
+    }
+    Pad.prev[k] = edges[k];
+  }
+}
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+}
+// any real user gesture unlocks audio if the browser kept it suspended (gamepad-only sessions)
+function unlockAudio() { if (Audio.ctx && Audio.ctx.state === 'suspended') Audio.ctx.resume(); }
+addEventListener('pointerdown', unlockAudio); addEventListener('keydown', unlockAudio);
+function fireDiv() { return G.power === 'rapid' ? 1 : 2; }   // 16ths with rapid, 8ths otherwise
+
+// A deliberate tap: judged against the grid. On-beat = PERFECT shot now. Off-beat = queued to next grid point.
+function tapFire() {
+  const p = G.player; if (!p || p.dead || !Audio.running) return;
+  const g = Audio.grid(fireDiv());
+  const now = Audio.now();
+  if (g.nearestDist <= PERFECT_WINDOW) {
+    const t = Math.max(now, g.nearest);
+    G.perfectStreak++; G.groove = Math.min(8, 1 + Math.floor(G.perfectStreak / 4));
+    G.judge = { text: 'PERFECT', color: C.amber, life: 1 };
+    queueShot(t, true);
+  } else {
+    G.perfectStreak = 0; G.groove = Math.max(1, G.groove - 1);
+    G.judge = { text: g.nearestDist > 0.2 ? 'LATE' : 'EARLY', color: 'rgba(55,255,214,0.5)', life: 1 };
+    queueShot(g.next, false);
+  }
+}
+// Holding fire: auto-shoot on every grid point, never perfect, never punished.
+function holdFire() {
+  const p = G.player; if (!p || p.dead || !Audio.running) return;
+  const g = Audio.grid(fireDiv());
+  if (g.next !== null) queueShot(g.next, false);
+}
+function queueShot(t, perfect) {
+  if (G.pending.some(s => Math.abs(s.t - t) < 0.02)) return;   // one shot per grid slot
+  G.pending.push({ t, perfect });
+  Audio.sfxShoot(t, perfect);
+}
+function spawnShot(perfect) {
+  const p = G.player, v = perfect ? 12 : 9;
+  const mk = (a) => ({ x: p.x, y: p.y - 14, vx: Math.sin(a) * v, vy: -Math.cos(a) * v, perfect, pierce: G.beam > 0 });
+  if (G.power === 'spread' || (perfect && G.groove >= 6)) [-0.22, 0, 0.22].forEach(a => G.bullets.push(mk(a)));
+  else G.bullets.push(mk(0));
+  if (G.beam > 0) G.flash = Math.max(G.flash, .3);
+}
+
+// ---------------------------------------------------------------------
+//  UPDATE
+// ---------------------------------------------------------------------
+function update() {
+  G.t++;
+  pollGamepad();
+  updateStars();
+  G.beatPulse *= .88; G.shake *= .85; G.flash *= .9; G.tunnel *= .97;
+  for (const p of G.particles) { p.x += p.vx; p.y += p.vy; p.vx *= .97; p.vy *= .97; p.life -= .03; }
+  G.particles = G.particles.filter(p => p.life > 0);
+  for (const t of G.toasts) { t.life -= t.big ? .013 : .022; t.ty -= .5; t.y += (t.ty - t.y) * .25; }
+  G.toasts = G.toasts.filter(t => t.life > 0);
+  if (G.judge) { G.judge.life -= .04; if (G.judge.life <= 0) G.judge = null; }
+  if (G.state !== 'play') return;
+
+  const p = G.player;
+  // heat decays; faster when the grid is thin (keeps you moving)
+  G.heat = Math.max(0, G.heat - (0.012 + 0.004 * G.layer)); syncLayer();
+  if (G.beam > 0 && G.beatPulse < .02 && G.phase !== 'drop') G.beam = 0;
+
+  if (p.dead > 0) {
+    p.dead--;
+    if (p.dead === 0) {
+      if (G.lives <= 0) { G.state = 'over'; Audio.setLayer(0); if (G.score > G.hi) { G.hi = G.score; try { localStorage.setItem('nir_hi', G.hi); } catch (e) {} } }
+      else { p.x = W / 2; G.ebullets = []; }
+    }
+  } else {
+    const spd = 6 + G.layer * .3;
+    if (G.keys.ArrowLeft || G.keys.KeyA || Pad.left) p.x -= spd;
+    if (G.keys.ArrowRight || G.keys.KeyD || Pad.right) p.x += spd;
+    if (Pad.axis && !Pad.left && !Pad.right) p.x += Pad.axis * spd;   // analog fine control inside the deadzone edge
+    if (G.touchX !== null) p.x += (G.touchX - p.x) * .3;
+    p.x = Math.max(24, Math.min(W - 24, p.x));
+    if (G.keys.Space || Pad.fire) holdFire();
+  }
+  if (G.powerT > 0 && --G.powerT === 0) G.power = null;
+
+  // release queued shots exactly when their grid time arrives
+  const now = Audio.now();
+  for (const s of G.pending) if (now >= s.t && p.dead === 0) { spawnShot(s.perfect); s.done = true; }
+  G.pending = G.pending.filter(s => !s.done && now < s.t + 1);
+
+  for (const b of G.bullets) { b.x += b.vx; b.y += b.vy; }
+  G.bullets = G.bullets.filter(b => b.y > -10 && b.x > 0 && b.x < W);
+  for (const b of G.ebullets) { b.y += b.vy; b.wob += .3; b.x += Math.sin(b.wob) * .8; }
+  G.ebullets = G.ebullets.filter(b => b.y < H + 10);
+  for (const inv of G.invaders) { inv.phase += .08 + G.layer * .02; if (inv.dive) updateDive(inv); }
+  updateBomb();
+  for (const bl of G.blasts) { bl.r += (BOMB_RADIUS * 1.2 - bl.r) * .18; bl.life -= .025; }
+  G.blasts = G.blasts.filter(b => b.life > 0);
+  if (G.ufo) { G.ufo.x += G.ufo.vx; if (G.ufo.x > W + 30) G.ufo = null; }
+  for (const pu of G.powerups) { pu.y += 1.6; pu.rot += .05; }
+  G.powerups = G.powerups.filter(pu => pu.y < H + 20);
+
+  // --- collisions ---
+  for (const b of G.bullets) {
+    if (b.hit) continue;
+    for (const inv of G.invaders) {
+      const ip = invPos(inv);
+      if (inv.hp > 0 && Math.abs(b.x - ip.x) < 14 && Math.abs(b.y - ip.y) < 12) {
+        inv.hp = 0; if (!b.pierce) b.hit = true;
+        const bonus = inv.dive ? 3 : inv.dance ? 2 : 1;
+        const pts = ((3 - inv.type) * 10 + G.wave * 5) * G.groove * (b.perfect ? 2 : 1) * bonus;
+        G.score += pts; addHeat((b.perfect ? 2 : 1) + (inv.dive ? 2 : 0));
+        burst(ip.x, ip.y, inv.dive ? C.white : b.perfect ? C.amber : C.hot, inv.dive ? 26 : 16, 3.5); Audio.sfxHit(); G.flash = Math.max(G.flash, .2);
+        if (inv.dive) toast('FIGHTER X3', C.white, false);
+        const r = Math.random();
+        if (r < .03 || (inv.dive && r < .12)) G.powerups.push({ x: ip.x, y: ip.y, kind: 'bomb', rot: 0 });
+        else if (r < .15) G.powerups.push({ x: ip.x, y: ip.y, kind: Math.random() < .5 ? 'spread' : 'rapid', rot: 0 });
+        if (!b.pierce) break;
+      }
+    }
+    if (!b.hit && G.ufo && Math.abs(b.x - G.ufo.x) < 20 && Math.abs(b.y - G.ufo.y) < 10) {
+      b.hit = true; G.score += 150 * G.groove; addHeat(6); burst(G.ufo.x, G.ufo.y, C.amber, 30, 5); G.ufo = null; Audio.sfxBoom(true); G.shake = 8;
+      G.powerups.push({ x: b.x, y: b.y, kind: Math.random() < .3 ? 'bomb' : 'spread', rot: 0 }); toast('UFO +HEAT', C.amber, false);
+    }
+    if (!b.hit && !b.pierce) for (const s of G.shields) if (s.hp > 0 && Math.abs(b.x - s.x) < 7 && Math.abs(b.y - s.y) < 7) { s.hp--; b.hit = true; burst(s.x, s.y, C.phos, 4, 1.5); break; }
+  }
+  G.bullets = G.bullets.filter(b => !b.hit);
+  G.invaders = G.invaders.filter(i => i.hp > 0);
+
+  for (const b of G.ebullets) {
+    if (b.hit) continue;
+    for (const s of G.shields) if (s.hp > 0 && Math.abs(b.x - s.x) < 7 && Math.abs(b.y - s.y) < 8) { s.hp--; b.hit = true; burst(s.x, s.y, C.phos, 4, 1.5); break; }
+    if (!b.hit && p.dead === 0 && Math.abs(b.x - p.x) < 12 && Math.abs(b.y - p.y) < 12) { b.hit = true; killPlayer(); }
+  }
+  G.ebullets = G.ebullets.filter(b => !b.hit);
+  G.shields = G.shields.filter(s => s.hp > 0);
+
+  for (const pu of G.powerups) {
+    if (p.dead === 0 && Math.abs(pu.x - p.x) < 18 && Math.abs(pu.y - p.y) < 18) {
+      pu.y = H + 99; Audio.sfxUnlock(); burst(p.x, p.y, C.amber, 20, 3);
+      if (pu.kind === 'bomb') { G.bombs = Math.min(3, G.bombs + 1); toast('RHYTHM BOMB (X)', C.white, false); }
+      else { G.power = pu.kind; G.powerT = 600; toast(pu.kind.toUpperCase(), C.amber, false); }
+    }
+  }
+  for (const inv of G.invaders) {
+    if (inv.y > H - 150) for (const s of G.shields) if (Math.abs(s.x - inv.x) < 16 && Math.abs(s.y - inv.y) < 16) s.hp = 0;
+    if (inv.y > p.y - 20 && p.dead === 0) killPlayer(true);
+    if (inv.dive && p.dead === 0) { const ip = invPos(inv); if (Math.abs(ip.x - p.x) < 14 && Math.abs(ip.y - p.y) < 14) { inv.hp = 0; killPlayer(); } }
+  }
+  G.invaders = G.invaders.filter(i => i.hp > 0);
+  if (G.invaders.length === 0) { G.wave++; G.score += 200 * G.groove; addHeat(8); spawnWave(); G.flash = 1; Audio.sfxUnlock(); toast('WAVE ' + G.wave, C.phos, true); }
+}
+function killPlayer(landed) {
+  const p = G.player; p.dead = 90; G.lives--; G.shake = 14; G.flash = .8;
+  G.heat *= .5; G.groove = 1; G.perfectStreak = 0; G.pending = []; syncLayer();
+  burst(p.x, p.y, C.white, 40, 5); Audio.sfxBoom(true);
+  if (landed) G.lives = 0;
+}
+
+// ---------------------------------------------------------------------
+//  DRAW
+// ---------------------------------------------------------------------
+function draw() {
+  ctx.globalCompositeOperation = 'source-over';
+  // deeper phosphor trails at high layers
+  ctx.fillStyle = `rgba(0,0,0,${0.45 - G.layer * 0.03})`; ctx.fillRect(0, 0, W, H);
+  if (G.flash > 0.02) { ctx.fillStyle = `rgba(55,255,214,${G.flash * .18})`; ctx.fillRect(0, 0, W, H); }
+  // TRIP: hue drifts every bar
+  canvas.style.filter = (G.state === 'play' && G.layer >= 7) ? `hue-rotate(${(G.t * 1.5) % 360}deg)` : 'none';
+
+  ctx.save();
+  ctx.translate((Math.random() - .5) * G.shake, (Math.random() - .5) * G.shake);
+  drawStars();
+  const pulse = 1 + G.beatPulse * (.05 + G.layer * .01);
+
+  if (G.state === 'title') drawTitle();
+  else if (G.state === 'about') drawAbout();
+  else {
+    if (G.layer >= 6 || G.tunnel > .05) drawTunnel();
+    // --- visual metronomes ---
+    const bp = G.beatPulse;
+    // frame breathes with the kick
+    strokePoly([[20, 20], [W - 20, 20], [W - 20, H - 20], [20, H - 20]], `rgba(55,255,214,${0.3 + bp * .5})`, 0, 0, 1, 0, 1 + bp * 2);
+    // top sweep: a bar of light that fires on the kick and drains out
+    line(20, 26, 20 + (W - 40) * bp, 26, C.phos, 1.5 + bp);
+    line(W - 20, H - 26, W - 20 - (W - 40) * bp, H - 26, 'rgba(55,255,214,0.5)', 1);
+    // beat counter: four ticks top-right, the current one lit
+    for (let i = 0; i < 4; i++) {
+      const lit = i === (G.beatIdx || 0);
+      strokePoly([[-3, -3], [3, -3], [3, 3], [-3, 3]], lit ? (i === 0 ? C.amber : C.phos) : 'rgba(55,255,214,0.3)', W - 100 + i * 14, 48, lit ? 1 + bp * .6 : .8, lit ? bp * .8 : 0, lit ? 2 : 1);
+    }
+    // 8th-note ticks climbing the side rails (hi-hats)
+    if (Audio.running && Audio.grid(1).prev !== null) {
+      const g8 = Audio.grid(2); const d8 = Audio.stepDur() * 2;
+      const f8 = 1 - Math.min(1, (Audio.now() - g8.prev) / d8);
+      line(20, 40 + (H - 80) * (1 - f8), 20, 40 + (H - 80) * (1 - f8) + 6, `rgba(55,255,214,${f8})`, 3);
+      line(W - 20, 40 + (H - 80) * f8, W - 20, 40 + (H - 80) * f8 + 6, `rgba(55,255,214,${f8})`, 3);
+      // 16th flicker on the corners at +HATS and above
+      if (G.layer >= 1) { const g16 = Audio.grid(1); const f16 = 1 - Math.min(1, (Audio.now() - g16.prev) / Audio.stepDur());
+        ctx.globalAlpha = f16 * .8; [[20, 20], [W - 20, 20], [20, H - 20], [W - 20, H - 20]].forEach(([x, y]) => strokePoly([[-5, 0], [0, -5], [5, 0], [0, 5]], C.phos, x, y, 1, 0, 1)); ctx.globalAlpha = 1; }
+    }
+    // beat grid strip: 8 ticks per bar, current position sweeps
+    if (Audio.running && Audio.grid(2).prev !== null) {
+      const g = Audio.grid(2); const d = Audio.stepDur() * 2;
+      const frac = g.prev === null ? 0 : (Audio.now() - g.prev) / d;
+      const slot = ((Audio.lastStep + Math.round((g.prev - Audio.lastStepTime) / Audio.stepDur())) % 16 + 16) % 16 / 2;
+      for (let i = 0; i < 8; i++) { const x = 40 + i * ((W - 80) / 7); line(x, H - 22, x, H - 14, i % 4 === 0 ? C.phos : 'rgba(55,255,214,0.35)', i % 4 === 0 ? 2 : 1); }
+      const x = 40 + ((slot + frac) % 8) * ((W - 80) / 7);
+      strokePoly([[0, -6], [5, 0], [0, 6], [-5, 0]], G.judge && G.judge.text === 'PERFECT' ? C.amber : C.phos, x, H - 18, 1, 0, 1.5);
+    }
+
+    for (const s of G.shields) strokePoly([[-5, -5], [5, -5], [5, 5], [-5, 5]], s.hp === 3 ? C.phos : s.hp === 2 ? '#22b39a' : '#136b5c', s.x, s.y, 1 + bp * .08, 0, 1.5 + bp);
+    const wob = 2 + G.layer * .6;
+    for (const inv of G.invaders) {
+      const base = inv.type === 0 ? C.hot : inv.type === 1 ? '#ff6bd6' : C.purple;
+      const ip = invPos(inv);
+      if (inv.dive) {
+        // fighter: white-hot, banked into its motion, with a short vector trail
+        const bank = Math.atan2(inv.ox - (inv.pox ?? inv.ox), 12) * .6;
+        line(ip.x, ip.y, ip.x - (inv.ox - (inv.pox ?? inv.ox)) * 3, ip.y - (inv.oy - (inv.poy ?? inv.oy)) * 3, 'rgba(232,255,251,0.5)', 1.5);
+        strokePoly(INVADERS[inv.type], C.white, ip.x, ip.y, pulse * 1.1, bank, 2.5);
+        inv.pox = inv.ox; inv.poy = inv.oy;
+      } else if (inv.dance > 0) {
+        // dancer: amber, lean + hop + spin + slide, all driven by the beat
+        const bp = G.beatPulse;
+        const dx = (inv.dLean || 0) * 8 * bp + (inv.dSlide || 0) * 10 * bp;
+        const dy = -(inv.dHop || 0) * 14 * bp;
+        const rot = (inv.dLean || 0) * .5 * (0.4 + bp) + (inv.dSpin || 0) * bp * Math.PI * 2;
+        strokePoly(INVADERS[inv.type], C.amber, ip.x + dx, ip.y + dy, pulse * (1 + bp * .15), rot, 2);
+        if (bp > .6) { const n = ['!', '+', '?'][inv.dstep % 3]; vtext(n, ip.x + dx + 14, ip.y + dy - 22, 7, C.amber, 'center', 1.2); }
+      } else {
+        strokePoly(INVADERS[inv.type], G.phase === 'break' ? 'rgba(255,43,214,0.4)' : base, ip.x, ip.y + Math.sin(inv.phase) * wob, pulse, Math.sin(inv.phase * .5) * (.08 + G.layer * .02));
+      }
+    }
+    if (G.bombProj) { const b = G.bombProj; strokePoly([[0, -9], [6, 0], [0, 9], [-6, 0]], C.white, b.x, b.y, 1, G.t * .2, 2); strokePoly([[0, -14], [10, 0], [0, 14], [-10, 0]], 'rgba(255,177,51,0.5)', b.x, b.y, 1, -G.t * .1, 1); }
+    for (const bl of G.blasts) {
+      ctx.globalAlpha = bl.life;
+      ctx.save(); ctx.strokeStyle = C.amber; ctx.lineWidth = 3; ctx.shadowColor = C.amber; ctx.shadowBlur = 20;
+      ctx.beginPath(); ctx.arc(bl.x, bl.y, bl.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(bl.x, bl.y, bl.r * .6, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+    if (G.ufo) strokePoly(UFO, C.amber, G.ufo.x, G.ufo.y + Math.sin(G.t * .2) * 3, pulse);
+    for (const pu of G.powerups) {
+      if (pu.kind === 'bomb') { strokePoly([[0, -10], [9, 0], [0, 10], [-9, 0]], C.white, pu.x, pu.y, 1, pu.rot); strokePoly([[0, -5], [4, 0], [0, 5], [-4, 0]], C.amber, pu.x, pu.y, 1, -pu.rot * 2, 1.5); }
+      else strokePoly([[0, -10], [9, 0], [0, 10], [-9, 0]], C.amber, pu.x, pu.y, 1, pu.rot);
+    }
+    for (const b of G.bullets) {
+      const col = b.pierce ? C.white : b.perfect ? C.amber : C.phos;
+      line(b.x - b.vx * .7, b.y - b.vy * .7, b.x + b.vx * .7, b.y + b.vy * .7, col, b.pierce ? 4 : b.perfect ? 3 : 2);
+    }
+    for (const b of G.ebullets) strokePoly([[0, -6], [3, 0], [0, 6], [-3, 0]], C.hot, b.x, b.y, 1, b.wob);
+    if (G.player && G.player.dead === 0) {
+      strokePoly(SHIP, G.beam > 0 ? C.white : C.phos, G.player.x, G.player.y, pulse);
+      const fl = 6 + bp * 16 + G.layer * 1.5;
+      strokePoly([[-4, 6], [0, 6 + fl], [4, 6]], G.layer >= 7 ? C.purple : C.amber, G.player.x, G.player.y, 1, 0, 1.5, false);
+      if (G.power && (G.powerT % 20 < 10 || G.powerT > 120)) strokePoly([[0, -20], [16, 12], [-16, 12]], C.amber, G.player.x, G.player.y, 1, 0, 1);
+      // pending shot indicator: a small charge line that grows until release
+      for (const s of G.pending) { const f = 1 - Math.min(1, (s.t - Audio.now()) / .25); line(G.player.x, G.player.y - 14, G.player.x, G.player.y - 14 - f * 10, s.perfect ? C.amber : C.phos, 2); }
+    }
+
+    // HUD
+    vtext('SCORE ' + G.score, 34, 36, 12, C.phos, 'left', 1.6 + bp);
+    vtext('HI ' + G.hi, W / 2, 36, 12, C.phos, 'center', 1.6 + bp);
+    vtext('WAVE ' + G.wave, W - 34, 36, 12, C.phos, 'right', 1.6 + bp);
+    for (let i = 0; i < G.lives; i++) strokePoly(SHIP, C.phos, 46 + i * 28, H - 40, .6, 0, 1.5);
+    for (let i = 0; i < G.bombs; i++) strokePoly([[0, -8], [6, 0], [0, 8], [-6, 0]], C.white, 150 + i * 20, H - 40, .8, G.t * .05, 1.5);
+    if (G.bombs) vtext('X', 150 + G.bombs * 20 + 2, H - 44, 8, 'rgba(232,255,251,0.6)', 'left', 1.2);
+    // heat + layer meter (left) and groove (right)
+    const hx = 34, hy = 58, hw = 200;
+    strokePoly([[hx, hy], [hx + hw, hy], [hx + hw, hy + 6], [hx, hy + 6]], 'rgba(55,255,214,0.35)', 0, 0, 1, 0, 1);
+    const hf = Math.min(1, G.heat / LAYERS[MAX_LAYER].heat);
+    if (hf > 0) line(hx, hy + 3, hx + hw * hf, hy + 3, G.layer >= 7 ? C.purple : G.layer >= 4 ? C.amber : C.phos, 4);
+    for (let i = 1; i <= MAX_LAYER; i++) { const x = hx + hw * LAYERS[i].heat / LAYERS[MAX_LAYER].heat; line(x, hy - 2, x, hy + 8, 'rgba(55,255,214,0.5)', 1); }
+    vtext(LAYERS[G.layer].name + '  ' + Audio.bpm + ' BPM', hx, hy + 14, 9, 'rgba(55,255,214,0.75)', 'left', 1.2);
+    vtext('GROOVE X' + G.groove, W - 34, hy + 4 - bp * 3 * (G.groove > 1 ? 1 : 0), 14 + bp * (G.groove - 1) * .5, G.groove > 1 ? C.amber : 'rgba(55,255,214,0.6)', 'right', G.groove > 1 ? 2 + bp : 1.3);
+    if (G.power) vtext(G.power + ' ' + Math.ceil(G.powerT / 60), W - 34, H - 48, 10, C.amber, 'right');
+    if (G.judge) { ctx.globalAlpha = G.judge.life; vtext(G.judge.text, G.player.x, G.player.y + 20, 8, G.judge.color, 'center', 1.3); ctx.globalAlpha = 1; }
+    if (G.beam > 0) vtext('BEAM', W / 2, H - 60, 16, C.white, 'center', 2.5);
+
+    for (const t of G.toasts) {
+      ctx.globalAlpha = Math.min(1, t.life * 2.5);
+      vtext(t.text, W / 2, t.y, t.big ? 48 : 18, t.color, 'center', t.big ? 4 + bp : 2.2);
+    }
+    ctx.globalAlpha = 1;
+
+    if (G.state === 'pause') { vtext('PAUSED', W / 2, H / 2 - 20, 40, C.phos, 'center', 3); vtext('P TO RESUME', W / 2, H / 2 + 40, 12, C.phos, 'center'); }
+    if (G.state === 'over') {
+      vtext('GAME OVER', W / 2, H / 2 - 40, 44, C.hot, 'center', 3);
+      vtext('SCORE ' + G.score + '   PEAK ' + LAYERS[G.maxLayer].name, W / 2, H / 2 + 30, 14, C.phos, 'center');
+      if (G.t % 60 < 40) vtext('PRESS SPACE TO RAVE AGAIN', W / 2, H / 2 + 80, 12, C.phos, 'center');
+    }
+  }
+  for (const p of G.particles) { ctx.globalAlpha = p.life; line(p.x, p.y, p.x - p.vx * p.len * .3, p.y - p.vy * p.len * .3, p.color, 1.5); }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawTunnel() {
+  // receding wireframe rectangles pulsing with the beat, Vectrex-style depth
+  const n = 7, a = (G.layer >= 6 ? .18 : 0) + G.tunnel * .3;
+  for (let i = 0; i < n; i++) {
+    const z = ((i / n) + (G.t * .004 + G.beatPulse * .05)) % 1;
+    const s = z * z, w = (W / 2 - 40) * s, h = (H / 2 - 40) * s;
+    ctx.globalAlpha = a * (1 - z);
+    strokePoly([[W / 2 - w, H / 2 - h], [W / 2 + w, H / 2 - h], [W / 2 + w, H / 2 + h], [W / 2 - w, H / 2 + h]], G.layer >= 7 ? C.purple : C.phos, 0, 0, 1, 0, 1);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTitle() {
+  const t = G.t, pulse = 1 + G.beatPulse * .08;
+  for (let i = 0; i < 12; i++) {
+    const x = 90 + i * 58, y = 130 + Math.sin(t * .04 + i * .6) * 12;
+    strokePoly(INVADERS[i % 3], i % 2 ? C.hot : C.purple, x, y, 1, Math.sin(t * .03 + i) * .15, 1.5);
+  }
+  ctx.save(); ctx.translate(W / 2, H / 2 - 40); ctx.scale(pulse, pulse);
+  vtext('NEON', 0, -60, 64, C.phos, 'center', 4);
+  vtext('INVADERS', 0, 10, 64, C.phos, 'center', 4);
+  ctx.restore();
+  vtext('R A V E', W / 2, H / 2 + 60, 26, C.hot, 'center', 2.5);
+  strokePoly(SHIP, C.phos, W / 2, H - 140, 1.4);
+  if (t % 60 < 42) vtext('PRESS SPACE OR TAP TO START', W / 2, H - 95, 12, C.phos, 'center');
+  vtext('KILLS BUILD HEAT. HEAT UNLOCKS THE MUSIC.', W / 2, H - 65, 9, 'rgba(55,255,214,0.6)', 'center', 1.2);
+  vtext('TAP FIRE ON THE BEAT FOR PERFECT SHOTS.', W / 2, H - 48, 9, 'rgba(55,255,214,0.6)', 'center', 1.2);
+  vtext('H FOR ABOUT', W - 34, 36, 10, 'rgba(55,255,214,0.6)', 'right', 1.2);
+  vtext('V' + APP_VERSION, W / 2, H / 2 + 100, 9, 'rgba(255,43,214,0.8)', 'center', 1.2);
+  vtext('GAMEPAD OK  F FULLSCREEN', 34, 36, 10, 'rgba(55,255,214,0.6)', 'left', 1.2);
+  if (Audio.ctx && Audio.ctx.state === 'suspended' && t % 40 < 28) vtext('AUDIO LOCKED. CLICK OR PRESS ANY KEY ONCE.', W / 2, H / 2 + 112, 10, C.amber, 'center', 1.4);
+}
+function drawAbout() {
+  strokePoly([[60, 28], [W - 60, 28], [W - 60, H - 28], [60, H - 28]], C.phos, 0, 0, 1, 0, 1.5);
+  vtext('ABOUT', W / 2, 46, 28, C.phos, 'center', 2.5);
+  vtext('V' + APP_VERSION, W / 2, 92, 10, C.hot, 'center', 1.4);
+  const lines = [
+    'NEON INVADERS RAVE. A SPACE INVADERS REMIX.',
+    '',
+    'THE SOUNDTRACK IS THE DIFFICULTY CURVE.',
+    'KILLS BUILD HEAT. HEAT UNLOCKS LAYERS:',
+    'KICK, HATS, CLAP, BASS, ACID, LEAD, STABS, TRIP.',
+    'MORE LAYERS: FASTER BPM, MORE FIRE, WILDER SCREEN.',
+    'HEAT COOLS DOWN IF YOU STOP KILLING.',
+    '',
+    'SHOTS SNAP TO THE BEAT GRID. TAP ON THE BEAT',
+    'FOR PERFECT SHOTS AND A GROOVE MULTIPLIER.',
+    'GROOVE X6 GIVES PERFECT SHOTS A SPREAD.',
+    'HOLD FIRE TO AUTO SHOOT ON EVERY 8TH NOTE.',
+    'EVERY 8 BARS FROM ACID UP: BREAK, THEN DROP.',
+    'ON THE DROP YOUR SHOTS PIERCE FOR ONE BAR.',
+    '',
+    'FIGHTERS PEEL OFF AND DIVE AT YOU. WORTH X3.',
+    'RHYTHM BOMB (X, OR B ON A GAMEPAD).',
+    'DANCERS STOP SHOOTING FOR 4 BARS. WORTH X2.',
+    '',
+    'ALL SOUND IS LIVE WEB AUDIO SYNTHESIS.',
+  ];
+  lines.forEach((l, i) => vtext(l, W / 2, 118 + i * 17, 9, C.phos, 'center', 1.3));
+  const yEnd = 118 + lines.length * 17;
+  vtext('MARCELO SOUZA / KUMODOT.ART - 2026 // @MSOUZA3D', W / 2, yEnd + 10, 11, C.amber, 'center', 1.6);
+  vtext('SUPPORT: KO-FI.COM/MSOUZA3D   MIT LICENSE', W / 2, yEnd + 34, 9, 'rgba(255,177,51,0.8)', 'center', 1.3);
+  if (G.t % 60 < 42) vtext('SPACE OR TAP TO GO BACK', W / 2, yEnd + 62, 10, C.phos, 'center', 1.2);
+}
+
+// ---------------------------------------------------------------------
+//  MAIN LOOP
+// ---------------------------------------------------------------------
+let last = 0, acc = 0;
+function loop(ts) {
+  const dt = Math.min(50, ts - last); last = ts; acc += dt;
+  while (acc >= 16.67) { update(); acc -= 16.67; }
+  draw();
+  requestAnimationFrame(loop);
+}
+ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

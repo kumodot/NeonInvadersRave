@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Invaders Rave</title>
+<meta name="description" content="Neon Invaders Rave: a Space Invaders remix where the soundtrack is the difficulty curve. Vector glow, procedural rave techno, one HTML file.">
+<meta property="og:title" content="Neon Invaders Rave">
+<meta property="og:description" content="Shoot on the beat. Kills unlock the music. A Space Invaders and Galaga remix with a live-synthesized rave soundtrack.">
+<meta property="og:image" content="https://kumodot.github.io/NeonInvadersRave/screenshots/neon_invaders_banner.png">
+<style>html,body{margin:0;background:#000;color:#37ffd6;font:12px "Courier New",Courier,monospace;letter-spacing:2px;text-transform:uppercase}
+body{display:flex;min-height:100vh;align-items:center;justify-content:center}a{color:#37ffd6}</style>
+</head>
+<body>
+<p id="msg">Loading Neon Invaders Rave...</p>
+<script>
+// Pages entry: always open the current build listed in version.json (no-store, so a new release shows up right away)
+const FALLBACK = 'NeonInvadersRave_v1.0.0.html';
+fetch('version.json', { cache: 'no-store' })
+  .then(r => r.json())
+  .then(v => location.replace(v.entry + location.search + location.hash))
+  .catch(() => { location.replace(FALLBACK); });
+</script>
+<noscript><a href="NeonInvadersRave_v1.0.0.html">Play Neon Invaders Rave</a></noscript>
+</body>
+</html>
